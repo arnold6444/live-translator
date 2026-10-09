@@ -71,7 +71,21 @@
       line-height: 1.6;
       pointer-events: none;
     }
-    #hint b { color: #bdbdbd; font-size: 22px; }
+    #hint.overlay { background: rgba(0, 0, 0, 0.8); z-index: 9; }
+    #hintBtn {
+      pointer-events: auto;
+      padding: 16px 36px;
+      border: 0;
+      border-radius: 999px;
+      background: #fff;
+      color: #000;
+      font: inherit;
+      font-size: 20px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    #hintBtn[hidden] { display: none; }
+    #hintText { max-width: 520px; white-space: pre-line; }
     #hint[hidden] { display: none; }
 
     /* 설정 바: 평소 숨김, 마우스 움직임/탭 시 표시 */
@@ -179,7 +193,7 @@
   <main id="feed" aria-live="polite"></main>
 
   <div id="hint">
-    <b>▶ 시작 (S)</b>
+    <button id="hintBtn" type="button">▶ 시작</button>
     <span id="hintText"></span>
   </div>
 

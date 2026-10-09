@@ -25,8 +25,15 @@ const MODES = {
 };
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-  (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+const UA = navigator.userAgent;
+const IS_IOS = /iPhone|iPad|iPod/.test(UA) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(UA));
+const IS_ANDROID = /Android/i.test(UA);
+const IS_MOBILE = IS_IOS || IS_ANDROID;
+// 아이폰 크롬·앱 안 브라우저는 애플 정책상 음성인식이 안 됨 (사파리만 됨)
+const IOS_NOT_SAFARI = IS_IOS && (/CriOS|FxiOS|EdgiOS|OPiOS|GSA\/|KAKAOTALK|NAVER|Line\/|Instagram|FBAN|FBAV|Whale|DaumApps/.test(UA) || !/Safari\//.test(UA));
+// 사파리(WebKit) 음성인식: 문장이 끝나도 확정이 안 오고 글자가 계속 이어 붙음 → 잠깐 조용하면 직접 끊어서 확정
+const WEBKIT_SPEECH = IS_IOS || (/Safari\//.test(UA) && !/Chrome|Chromium|Edg\//.test(UA));
+const PAUSE_MS = 900;
 const CAN_CAPTURE_PC = !IS_MOBILE && !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
 const CHROME_VER = parseInt((navigator.userAgent.match(/Chrome\/(\d+)/) || [])[1] || '0', 10);
 const TRACK_INPUT_OK = CHROME_VER >= 139; // 음성인식에 PC 소리 트랙을 넣는 기능 (최신 크롬)
@@ -59,7 +66,7 @@ function saveSettings() {
 // ===== 화면 요소 =====
 const $ = id => document.getElementById(id);
 const el = {
-  feed: $('feed'), hint: $('hint'), hintText: $('hintText'), bar: $('bar'),
+  feed: $('feed'), hint: $('hint'), hintBtn: $('hintBtn'), hintText: $('hintText'), bar: $('bar'),
   run: $('run'), mode: $('mode'), source: $('source'), their: $('their'), mine: $('mine'),
   swap: $('swap'), smaller: $('smaller'), bigger: $('bigger'), srcToggle: $('srcToggle'),
   clear: $('clear'), full: $('full'), speak: $('speak'), status: $('status'), msg: $('msg'), engine: $('engine'),
@@ -89,7 +96,7 @@ function newLine(side) {
   node.innerHTML = '<div class="src"></div><div class="tr"></div>';
   el.feed.appendChild(node);
   while (el.feed.children.length > MAX_LINES) el.feed.firstElementChild.remove();
-  el.hint.hidden = true;
+  renderHint();
   return { side, from, to, node, srcEl: node.firstChild, trEl: node.lastChild, text: '', req: 0, timer: null };
 }
 
@@ -251,11 +258,17 @@ class Listener {
     this.timer = null;
     this.backoff = 0;
     this.waiters = [];
+    this.everStarted = false; // 한 번이라도 듣기 시작했으면 권한은 있는 것
+    this.waitingTap = false;  // 아이폰: 다시 시작하려면 탭이 필요해서 멈춘 상태
+    this.full = '';           // 사파리: 지금 세션에서 들은 전체 글자
+    this.cut = 0;             // 사파리: 그중 이미 자막으로 확정한 위치
+    this.pause = null;
   }
 
   start() {
     if (this.active) return;
     this.active = true;
+    this.waitingTap = false;
     if (!this.rec) this.spawn(); // 끝나는 중인 세션이 있으면 onend에서 다시 시작
   }
 
@@ -274,8 +287,21 @@ class Listener {
 
   // 화자/언어 전환: 지금 세션을 확정하고 새 설정으로 다시 시작
   switchTo(side, lang) {
+    const oldSide = this.side;
     this.side = side;
     this.lang = lang;
+    if (WEBKIT_SPEECH && this.rec) {
+      // 사파리는 탭 밖에서 다시 시작하면 막힐 수 있음 → 지금(탭 안에서) 바로 새로 시작
+      const old = this.rec;
+      this.rec = null;
+      old.onend = old.onresult = old.onerror = null;
+      clearTimeout(this.pause);
+      flushInterim(oldSide);
+      this.waiters.splice(0).forEach(fn => fn());
+      try { old.abort(); } catch {}
+      if (this.active) this.spawn();
+      return;
+    }
     if (this.rec) {
       try { this.rec.stop(); } catch {}
     } else if (this.active) {
@@ -290,19 +316,36 @@ class Listener {
     const lang = this.lang;
     const rec = new SR();
     rec.lang = LANG[lang].stt;
-    rec.continuous = !IS_MOBILE; // 모바일은 문장마다 끊고 다시 시작하는 쪽이 안정적
+    // 안드로이드는 문장마다 끊고 다시 시작하는 쪽이 안정적. 아이폰은 다시 시작이 막힐 수 있어 계속 듣기
+    rec.continuous = !IS_ANDROID;
     rec.interimResults = true;
     rec.maxAlternatives = 1;
     let startedAt = 0;
     let heard = false;
+    this.full = '';
+    this.cut = 0;
+    clearTimeout(this.pause);
+
+    // 아이폰: 시작 신호가 안 오면(다시 시작이 조용히 막힘) 탭해서 계속 듣기로 전환
+    const watchdog = WEBKIT_SPEECH ? setTimeout(() => {
+      if (this.rec !== rec || startedAt) return;
+      this.rec = null;
+      try { rec.abort(); } catch {}
+      requestTap(this);
+    }, 4000) : null;
 
     rec.onstart = () => {
       startedAt = Date.now();
+      this.everStarted = true;
+      clearTimeout(watchdog);
       if (el.status.classList.contains('err')) setStatus(listeningText());
+      renderHint();
     };
+    rec.onsoundstart = () => renderHint('소리 감지됨…');
     rec.onresult = e => {
       heard = true;
       this.backoff = 0;
+      if (WEBKIT_SPEECH) return this.webkitResult(e, side);
       let fin = '';
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -315,8 +358,10 @@ class Listener {
     };
     rec.onerror = e => onRecError(this, e.error, lang);
     rec.onend = () => {
+      clearTimeout(watchdog);
       if (this.rec !== rec) return;
       this.rec = null;
+      clearTimeout(this.pause);
       flushInterim(side);
       this.waiters.splice(0).forEach(fn => fn());
       if (!this.active) return;
@@ -329,10 +374,29 @@ class Listener {
       this.track ? rec.start(this.track) : rec.start();
     } catch (err) {
       console.warn('recognition start failed', err);
+      clearTimeout(watchdog);
       this.rec = null;
       if (this.track && this.track.readyState !== 'live') return;
+      if (WEBKIT_SPEECH) { requestTap(this); return; }
       this.timer = setTimeout(() => { if (this.active && !this.rec) this.spawn(); }, 1000);
     }
+  }
+
+  // 사파리: 결과가 한 줄로 계속 이어 붙음 → 새로 붙은 부분만 자막으로, 잠깐 조용하면 확정
+  webkitResult(e, side) {
+    let full = '';
+    for (let i = 0; i < e.results.length; i++) full += e.results[i][0].transcript;
+    this.full = full;
+    if (full.length < this.cut / 2) this.cut = 0; // 사파리가 결과를 새로 시작한 경우
+    clearTimeout(this.pause);
+    const fresh = full.slice(this.cut).trim();
+    if (!fresh) return;
+    showInterim(side, fresh);
+    this.pause = setTimeout(() => {
+      const text = this.full.slice(this.cut).trim();
+      this.cut = this.full.length;
+      if (text) commit(side, text);
+    }, PAUSE_MS);
   }
 }
 
@@ -345,10 +409,12 @@ function onRecError(listener, code, lang) {
       return;
     case 'not-allowed':
     case 'service-not-allowed':
+      if (WEBKIT_SPEECH && listener.everStarted && !IOS_NOT_SAFARI) {
+        requestTap(listener); // 권한은 있음 → 사파리가 탭 없이 다시 시작하는 걸 막은 것
+        return;
+      }
       listener.active = false;
-      setStatus(listener.track
-        ? 'PC 소리 인식이 막혔어요. 크롬을 최신으로 업데이트해 주세요.'
-        : '마이크 권한이 거부됐어요. 주소창 왼쪽 아이콘에서 마이크를 허용한 뒤 다시 시작해 주세요.', true);
+      setStatus(permissionHelp(listener, code), true);
       break;
     case 'audio-capture':
       listener.active = false;
@@ -370,6 +436,34 @@ function onRecError(listener, code, lang) {
   if (app.running && !app.listeners.some(l => l.active)) stopApp(false);
 }
 
+function permissionHelp(listener, code) {
+  if (listener.track) return 'PC 소리 인식이 막혔어요. 크롬을 최신으로 업데이트해 주세요.';
+  if (IOS_NOT_SAFARI) return '아이폰은 사파리에서만 음성인식이 돼요. 이 주소를 사파리로 열어 주세요.';
+  if (IS_IOS) {
+    return code === 'service-not-allowed'
+      ? '아이폰 설정 > 일반 > 키보드 > "받아쓰기 활성화"를 켠 뒤 다시 시작해 주세요.'
+      : '마이크·음성 인식이 거부됐어요. 설정 > 앱 > Safari > 마이크를 "허용"으로 바꾸고 새로고침해 주세요.';
+  }
+  return '마이크 권한이 거부됐어요. 주소창 왼쪽 아이콘에서 마이크를 허용한 뒤 다시 시작해 주세요.';
+}
+
+// 아이폰: 사파리가 탭 없이 다시 듣기를 막으면, 화면을 한 번 탭해서 이어 듣기
+function requestTap(listener) {
+  listener.active = false;
+  listener.waitingTap = true;
+  if (!app.running) return;
+  flushInterim(listener.side);
+  app.needsTap = true;
+  renderUI();
+}
+
+function resumeFromTap() {
+  if (!app.running || !app.needsTap) return;
+  app.needsTap = false;
+  for (const l of app.listeners) if (l.waitingTap) l.start(); // 탭 안에서 바로 시작
+  renderUI();
+}
+
 // ===== 실행 상태 =====
 const app = {
   running: false,
@@ -380,6 +474,7 @@ const app = {
   pttDown: false,
   talkSide: 'them',
   wakeLock: null,
+  needsTap: false, // 아이폰: 탭해서 계속 듣기 대기
 };
 
 const conflictTimes = [];
@@ -463,6 +558,7 @@ async function startApp() {
     app.running = true;
     app.ptt = false;
     app.pttDown = false;
+    app.needsTap = false;
     conflictTimes.length = 0;
     app.listeners[0].start();
     if (app.listeners[1]) setTimeout(() => { if (app.running && !app.ptt) app.listeners[1].start(); }, 600);
@@ -481,6 +577,7 @@ async function stopApp(resetStatus = true) {
   app.running = false;
   app.ptt = false;
   app.pttDown = false;
+  app.needsTap = false;
   const listeners = app.listeners;
   app.listeners = [];
   if (resetStatus) setStatus('멈춤');
@@ -569,12 +666,7 @@ function renderUI() {
   el.their.value = S.their;
   el.mine.value = S.mine;
   el.srcToggle.classList.toggle('on', S.showSrc);
-
-  el.hintText.textContent = {
-    call: "상대 소리(PC)와 내 마이크를 함께 받아 적어요. 시작하면 뜨는 공유 창에서 통화 창(또는 전체 화면)을 고르고 '오디오 공유'를 켜세요. 헤드폰을 쓰면 더 정확해요.",
-    listen: S.source === 'pc' ? 'PC에서 나는 소리를 받아 적어 번역해요.' : '마이크로 들리는 말을 받아 적어 번역해요.',
-    talk: '마이크 하나로 번갈아 말해요. 아래 버튼(또는 Space)으로 말하는 사람을 바꿔요.',
-  }[S.mode];
+  renderHint();
 
   let speak = '';
   let speakSide = '';
@@ -593,6 +685,36 @@ function renderUI() {
   document.body.classList.toggle('has-speak', !!speak);
   if (!app.running) showUI(true);
   autoscroll();
+}
+
+// 가운데 안내: 시작 전엔 시작 버튼, 듣는 중엔 상태, 아이폰이 멈추면 '탭해서 계속 듣기'
+function renderHint(extra = '') {
+  const empty = !el.feed.children.length;
+  el.hint.hidden = !(empty || app.needsTap);
+  el.hint.classList.toggle('overlay', app.needsTap && !empty);
+  if (el.hint.hidden) return;
+  if (app.needsTap) {
+    el.hintBtn.hidden = false;
+    el.hintBtn.textContent = '▶ 탭해서 계속 듣기';
+    el.hintText.textContent = '아이폰은 듣기가 끊기면 한 번 탭해야 이어서 들어요.';
+    return;
+  }
+  if (app.running) {
+    const lang = S.mode === 'talk' && app.talkSide === 'me' ? S.mine : S.their;
+    el.hintBtn.hidden = true;
+    el.hintText.textContent = `🎙 ${listeningText()}${extra ? ` · ${extra}` : ''}\n` +
+      (S.mode === 'call' ? '두 사람 말이 들리면 자막이 떠요' : `${LANG[lang].name} 말이 들리면 자막이 떠요`);
+    return;
+  }
+  el.hintBtn.hidden = false;
+  el.hintBtn.textContent = '▶ 시작';
+  el.hintText.textContent = {
+    call: "상대 소리(PC)와 내 마이크를 함께 받아 적어요. 시작하면 뜨는 공유 창에서 통화 창(또는 전체 화면)을 고르고 '오디오 공유'를 켜세요. 헤드폰을 쓰면 더 정확해요.",
+    listen: S.source === 'pc'
+      ? `PC에서 나는 ${LANG[S.their].name} 소리를 받아 적어 ${LANG[S.mine].name}로 번역해요.`
+      : `마이크로 들리는 ${LANG[S.their].name} 말을 받아 적어 ${LANG[S.mine].name}로 번역해요.`,
+    talk: '마이크 하나로 번갈아 말해요. 아래 버튼(또는 Space)으로 말하는 사람을 바꿔요.',
+  }[S.mode] + (IOS_NOT_SAFARI ? '\n\n⚠ 아이폰은 사파리에서만 음성인식이 돼요. 이 주소를 사파리로 열어 주세요.' : '');
 }
 
 function onLangChange() {
@@ -640,8 +762,15 @@ el.clear.addEventListener('click', () => {
   el.feed.innerHTML = '';
   live.them = null;
   live.me = null;
-  el.hint.hidden = false;
+  renderHint();
 });
+el.hintBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  if (app.needsTap) resumeFromTap();
+  else if (!app.running) startApp();
+});
+// 아이폰: 멈췄을 때 화면 아무 데나 탭해도 이어 듣기
+document.addEventListener('click', () => { if (app.needsTap) resumeFromTap(); });
 el.full.addEventListener('click', toggleFullscreen);
 
 // 클릭 후 포커스가 남으면 Space가 버튼을 또 누르므로 해제
