@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <title>Live Translator</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      --fs: 36px;
+      --fg: #ffffff;
+      --dim: #8c8c8c;
+      --me: #9fd8ff;
+      --err: #ff8a80;
+      --ctl-bg: #1a1a1a;
+      --ctl-line: #333333;
+    }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      color: var(--fg);
+      font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+      -webkit-text-size-adjust: 100%;
+    }
+    body { overflow: hidden; }
+
+    /* 자막 영역: 아래부터 쌓이고 자동 스크롤 */
+    #feed {
+      position: fixed;
+      inset: 0;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      padding: 24px max(16px, 4vw) calc(72px + env(safe-area-inset-bottom));
+      scrollbar-width: none;
+    }
+    #feed::-webkit-scrollbar { display: none; }
+    body.has-speak #feed { padding-bottom: calc(120px + env(safe-area-inset-bottom)); }
+    #feed > .line:first-child { margin-top: auto; }
+    .line {
+      width: 100%;
+      max-width: 1100px;
+      margin: 0 auto 0.8em;
+      font-size: var(--fs);
+      overflow-wrap: anywhere;
+    }
+    .line.me { text-align: right; }
+    .line .src { font-size: 0.5em; line-height: 1.4; color: var(--dim); margin-bottom: 0.15em; }
+    .line .tr { line-height: 1.35; font-weight: 600; }
+    .line .tr:empty { display: none; }
+    .line .tr.fail { color: var(--dim); font-weight: 400; font-size: 0.5em; }
+    .line.me .tr { color: var(--me); }
+    .line.interim { opacity: 0.55; }
+    body.no-src .line .src { display: none; }
+
+    /* 시작 전 안내 */
+    #hint {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 24px;
+      text-align: center;
+      color: #6f6f6f;
+      font-size: 16px;
+      line-height: 1.6;
+      pointer-events: none;
+    }
+    #hint b { color: #bdbdbd; font-size: 22px; }
+    #hint[hidden] { display: none; }
+
+    /* 설정 바: 평소 숨김, 마우스 움직임/탭 시 표시 */
+    #bar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 10;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: calc(10px + env(safe-area-inset-top)) 16px 12px;
+      background: linear-gradient(rgba(0, 0, 0, 0.96), rgba(0, 0, 0, 0.8));
+      font-size: 14px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s;
+    }
+    body.ui #bar { opacity: 1; pointer-events: auto; }
+    #bar .group { display: inline-flex; align-items: center; gap: 6px; }
+    #bar .spacer { flex: 1; }
+    #bar label { color: var(--dim); }
+    #bar button, #bar select {
+      background: var(--ctl-bg);
+      color: #eee;
+      border: 1px solid var(--ctl-line);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font: inherit;
+      cursor: pointer;
+    }
+    #bar select:disabled { opacity: 0.5; cursor: default; }
+    #bar button.on { border-color: #888; color: #fff; }
+    #run { background: #fff !important; color: #000 !important; font-weight: 700; min-width: 76px; }
+    body.running #run { background: #c62828 !important; color: #fff !important; }
+    #source[hidden] { display: none; }
+
+    /* 상태 줄 */
+    #status {
+      position: fixed;
+      left: 16px;
+      right: 16px;
+      bottom: calc(12px + env(safe-area-inset-bottom));
+      z-index: 10;
+      font-size: 13px;
+      color: #777;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s;
+    }
+    body.ui #status, #status.err { opacity: 1; }
+    #status.err #msg { color: var(--err); }
+    #engine { margin-left: 10px; color: #555; }
+
+    /* 듣는 중 표시 */
+    #dot {
+      position: fixed;
+      top: calc(14px + env(safe-area-inset-top));
+      right: 16px;
+      z-index: 11;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #e53935;
+      opacity: 0;
+    }
+    body.running #dot { animation: pulse 2s ease-in-out infinite; }
+    body.ui #dot { opacity: 0 !important; animation: none; }
+    @keyframes pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.9; } }
+
+    /* 화자 전환(대화) / 누르고 말하기(통화 대체) 버튼 */
+    #speak {
+      position: fixed;
+      left: 50%;
+      bottom: calc(40px + env(safe-area-inset-bottom));
+      transform: translateX(-50%);
+      z-index: 10;
+      padding: 14px 22px;
+      border-radius: 999px;
+      border: 1px solid #555;
+      background: rgba(30, 30, 30, 0.9);
+      color: #fff;
+      font: inherit;
+      font-size: 16px;
+      white-space: nowrap;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+      cursor: pointer;
+    }
+    #speak.me { border-color: var(--me); color: var(--me); }
+    #speak.down { background: #0d3a52; }
+    #speak[hidden] { display: none; }
+
+    @media (max-width: 600px) {
+      #bar { font-size: 13px; gap: 6px; padding-left: 12px; padding-right: 12px; }
+      #bar button, #bar select { padding: 6px 8px; }
+      #bar .spacer { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main id="feed" aria-live="polite"></main>
+
+  <div id="hint">
+    <b>▶ 시작 (S)</b>
+    <span id="hintText"></span>
+  </div>
+
+  <div id="bar">
+    <button id="run" type="button">▶ 시작</button>
+    <select id="mode" title="모드"></select>
+    <select id="source" title="소리 입력">
+      <option value="mic">마이크</option>
+      <option value="pc">PC 소리</option>
+    </select>
+    <span class="group">
+      <label for="their">상대</label>
+      <select id="their"></select>
+      <button id="swap" type="button" title="언어 서로 바꾸기">⇄</button>
+      <label for="mine">나</label>
+      <select id="mine"></select>
+    </span>
+    <span class="spacer"></span>
+    <span class="group">
+      <button id="smaller" type="button" title="글자 작게 (-)">A−</button>
+      <button id="bigger" type="button" title="글자 크게 (+)">A+</button>
+      <button id="srcToggle" type="button" title="원문 보이기/숨기기">원문</button>
+      <button id="clear" type="button" title="자막 지우기">지우기</button>
+      <button id="full" type="button" title="전체화면 (F)">⛶</button>
+    </span>
+  </div>
+
+  <button id="speak" type="button" hidden></button>
+  <div id="status"><span id="msg"></span><span id="engine"></span></div>
+  <div id="dot"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
