@@ -53,6 +53,7 @@
     .line .tr.fail { color: var(--dim); font-weight: 400; font-size: 0.5em; }
     .line.me .tr { color: var(--me); }
     .line.interim { opacity: 0.55; }
+    .line.pending .tr { color: var(--dim); font-weight: 400; }
     body.no-src .line .src { display: none; }
 
     /* 시작 전 안내 */
@@ -138,7 +139,7 @@
       pointer-events: none;
       transition: opacity 0.25s;
     }
-    body.ui #status, #status.err { opacity: 1; }
+    body.ui #status, #status.err, #status.sticky { opacity: 1; }
     #status.err #msg { color: var(--err); }
     #engine { margin-left: 10px; color: #555; }
 
@@ -199,6 +200,7 @@
 
   <div id="bar">
     <button id="run" type="button">▶ 시작</button>
+    <select id="asr" title="음성인식 엔진"></select>
     <select id="mode" title="모드"></select>
     <select id="source" title="소리 입력">
       <option value="mic">마이크</option>

@@ -24,6 +24,17 @@ const MODES = {
   talk: '대화 (마주 보고)',
 };
 
+// 음성인식 엔진: 자동 감지(Whisper, 기기 안에서 무료) / 언어 고정(크롬 음성인식)
+const ENGINES = {
+  'auto-base': '자동 감지 · 빠름',
+  'auto-small': '자동 감지 · 정확',
+  chrome: '언어 고정 · 크롬',
+};
+const WHISPER_MODEL = {
+  'auto-base': 'onnx-community/whisper-base',
+  'auto-small': 'onnx-community/whisper-small',
+};
+
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const UA = navigator.userAgent;
 const IS_IOS = /iPhone|iPad|iPod/.test(UA) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(UA));
@@ -42,7 +53,10 @@ const MAX_LINES = 200;
 const INTERIM_DELAY = 800; // 말하는 중 미리 번역 간격(ms)
 
 // ===== 설정 (브라우저에 저장) =====
-const DEFAULTS = { mode: 'call', source: 'mic', their: 'en', mine: 'ko', fontSize: IS_MOBILE ? 24 : 36, showSrc: true };
+const DEFAULTS = {
+  engine: 'auto-base', // 측정: 빠름 ≈ 문장당 1초, 정확 ≈ 2~3초
+  mode: 'call', source: 'mic', their: 'en', mine: 'ko', fontSize: IS_MOBILE ? 24 : 36, showSrc: true,
+};
 const S = loadSettings();
 
 function loadSettings() {
@@ -52,6 +66,7 @@ function loadSettings() {
   if (!LANG[s.their]) s.their = DEFAULTS.their;
   if (!LANG[s.mine]) s.mine = DEFAULTS.mine;
   if (!MODES[s.mode]) s.mode = DEFAULTS.mode;
+  if (!ENGINES[s.engine]) s.engine = DEFAULTS.engine;
   if (!CAN_CAPTURE_PC) {
     if (s.mode === 'call') s.mode = 'listen';
     s.source = 'mic';
@@ -67,14 +82,16 @@ function saveSettings() {
 const $ = id => document.getElementById(id);
 const el = {
   feed: $('feed'), hint: $('hint'), hintBtn: $('hintBtn'), hintText: $('hintText'), bar: $('bar'),
-  run: $('run'), mode: $('mode'), source: $('source'), their: $('their'), mine: $('mine'),
+  run: $('run'), asr: $('asr'), mode: $('mode'), source: $('source'), their: $('their'), mine: $('mine'),
   swap: $('swap'), smaller: $('smaller'), bigger: $('bigger'), srcToggle: $('srcToggle'),
   clear: $('clear'), full: $('full'), speak: $('speak'), status: $('status'), msg: $('msg'), engine: $('engine'),
 };
 
-function setStatus(text, isErr = false) {
+// sticky: 설정 바가 숨어 있어도 계속 보이게 (모델 내려받는 중 등)
+function setStatus(text, isErr = false, sticky = false) {
   el.msg.textContent = text;
   el.status.classList.toggle('err', isErr);
+  el.status.classList.toggle('sticky', sticky);
   if (isErr) showUI();
 }
 
@@ -237,14 +254,19 @@ async function translate(text, from, to) {
 }
 
 async function translateOnline(text, from, to) {
-  const sl = LANG[from].web || from;
+  return (await translateOnlineRaw(text, from, to)).text;
+}
+
+// from에 'auto'를 주면 src에 감지된 언어가 옴
+async function translateOnlineRaw(text, from, to) {
+  const sl = from === 'auto' ? 'auto' : (LANG[from].web || from);
   const tl = LANG[to].web || to;
   const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t' +
     `&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&q=${encodeURIComponent(text.slice(0, 1500))}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return (data[0] || []).map(seg => seg[0]).join('');
+  return { text: (data[0] || []).map(seg => seg[0]).join(''), src: String(data[2] || '').split('-')[0] };
 }
 
 // ===== 음성인식 =====
@@ -438,7 +460,7 @@ function onRecError(listener, code, lang) {
 
 function permissionHelp(listener, code) {
   if (listener.track) return 'PC 소리 인식이 막혔어요. 크롬을 최신으로 업데이트해 주세요.';
-  if (IOS_NOT_SAFARI) return '아이폰은 사파리에서만 음성인식이 돼요. 이 주소를 사파리로 열어 주세요.';
+  if (IOS_NOT_SAFARI) return '아이폰 크롬·앱 안 브라우저에서는 "언어 고정" 엔진이 안 돼요. 엔진을 "자동 감지"로 바꾸거나 사파리로 열어 주세요.';
   if (IS_IOS) {
     return code === 'service-not-allowed'
       ? '아이폰 설정 > 일반 > 키보드 > "받아쓰기 활성화"를 켠 뒤 다시 시작해 주세요.'
@@ -460,6 +482,7 @@ function requestTap(listener) {
 function resumeFromTap() {
   if (!app.running || !app.needsTap) return;
   app.needsTap = false;
+  auto.ctx?.resume().catch(() => {});
   for (const l of app.listeners) if (l.waitingTap) l.start(); // 탭 안에서 바로 시작
   renderUI();
 }
@@ -468,6 +491,7 @@ function resumeFromTap() {
 const app = {
   running: false,
   starting: false,
+  engine: '',      // 실행 중인 엔진: 'auto'(Whisper) 또는 'chrome'
   listeners: [],
   stream: null,
   ptt: false,      // 통화 모드에서 인식기 2개 동시 실행이 안 될 때: 누르고 있는 동안 내 말
@@ -519,7 +543,7 @@ async function pttUp() {
 }
 
 function switchSpeaker() {
-  if (!app.running || S.mode !== 'talk') return;
+  if (!app.running || app.engine !== 'chrome' || S.mode !== 'talk') return;
   app.talkSide = app.talkSide === 'them' ? 'me' : 'them';
   app.listeners[0].switchTo(app.talkSide, app.talkSide === 'them' ? S.their : S.mine);
   setStatus(listeningText());
@@ -527,6 +551,10 @@ function switchSpeaker() {
 }
 
 function listeningText() {
+  if (app.engine === 'auto') {
+    const hw = asr.ready ? ` · ${asr.device === 'webgpu' ? 'GPU' : 'CPU'}` : '';
+    return `듣는 중 · 자동 감지 (${LANG[S.their].name} ⇄ ${LANG[S.mine].name})${hw}`;
+  }
   if (S.mode === 'talk') {
     const lang = app.talkSide === 'them' ? S.their : S.mine;
     return `듣는 중 · ${app.talkSide === 'them' ? '상대' : '나'} (${LANG[lang].name})`;
@@ -537,16 +565,18 @@ function listeningText() {
 
 async function startApp() {
   if (app.running || app.starting) return;
+  if (S.engine !== 'chrome') return startAuto();
   if (!SR) {
-    setStatus('이 브라우저는 음성인식을 지원하지 않아요. PC·안드로이드는 크롬, 아이폰은 사파리로 열어 주세요.', true);
+    setStatus('이 브라우저는 크롬 음성인식을 지원하지 않아요. 엔진을 "자동 감지"로 바꿔 주세요.', true);
     return;
   }
   prepareTranslators(); // 클릭 직후(사용자 동작 안)에 호출
   const needPc = S.mode === 'call' || (S.mode === 'listen' && S.source === 'pc');
   app.starting = true;
+  app.engine = 'chrome';
   try {
     let audioTrack = null;
-    if (needPc) audioTrack = await capturePcAudio();
+    if (needPc) audioTrack = await capturePcAudio(true);
     if (S.mode === 'call') {
       app.listeners = [new Listener('them', S.their, audioTrack), new Listener('me', S.mine)];
     } else if (S.mode === 'listen') {
@@ -582,6 +612,7 @@ async function stopApp(resetStatus = true) {
   app.listeners = [];
   if (resetStatus) setStatus('멈춤');
   renderUI();
+  cleanupAuto(); // 말하던 문장은 마저 받아 적음
   await Promise.all(listeners.map(l => l.stop(true)));
   if (app.stream) {
     app.stream.getTracks().forEach(t => t.stop());
@@ -596,9 +627,10 @@ function toggleRun() {
   app.running ? stopApp() : startApp();
 }
 
-async function capturePcAudio() {
+// needTrackInput: 크롬 음성인식에 PC 소리를 넣는 경우 (최신 크롬 필요)
+async function capturePcAudio(needTrackInput) {
   if (!CAN_CAPTURE_PC) throw new Error('이 기기에서는 PC 소리를 받을 수 없어요. 소리 입력을 마이크로 바꿔 주세요.');
-  if (!TRACK_INPUT_OK) throw new Error('PC 소리 인식은 최신 크롬이 필요해요. 크롬을 업데이트해 주세요.');
+  if (needTrackInput && !TRACK_INPUT_OK) throw new Error('PC 소리 인식은 최신 크롬이 필요해요. 크롬을 업데이트해 주세요.');
   let stream;
   try {
     stream = await navigator.mediaDevices.getDisplayMedia({
@@ -637,8 +669,450 @@ document.addEventListener('visibilitychange', () => {
   if (app.running && document.visibilityState === 'visible') keepAwake();
 });
 
+// ===== 자동 감지 엔진: 소리 → 말 끊김마다 자르기 → Whisper(언어 자동) → 번역 =====
+const RATE = 16000;      // Whisper 입력
+const FRAME = 320;       // 20ms
+const PREROLL = 15;      // 말 시작 직전 0.3초도 포함
+const END_SILENCE = 35;  // 0.7초 조용하면 문장 끝
+const MAX_FRAMES = 600;  // 12초가 넘으면 조용한 곳에서 자름
+const MIN_VOICED = 12;   // 0.24초보다 짧은 소리는 무시
+
+const WORKLET_SRC = `class C extends AudioWorkletProcessor {
+  constructor() { super(); this.b = new Float32Array(2048); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) for (let i = 0; i < ch.length; i++) {
+      this.b[this.n++] = ch[i];
+      if (this.n === 2048) { this.port.postMessage(this.b.slice(0)); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor('lt-capture', C);`;
+
+// 소리 크기로 말 시작/끝을 찾아 문장 단위 오디오(16kHz)를 만듦
+class Segmenter {
+  constructor(ctx, audioTrack, handlers) {
+    this.ctx = ctx;
+    this.track = audioTrack;
+    this.h = handlers;
+    this.ratio = ctx.sampleRate / RATE;
+    this.left = new Float32Array(0);
+    this.t = 0;
+    this.buf = [];
+    this.noise = 0;
+    this.run = 0;
+    this.pre = [];
+    this.speaking = false;
+    this.frames = [];
+    this.levels = [];
+    this.silent = 0;
+    this.voiced = 0;
+    this.line = null;
+  }
+
+  async start() {
+    if (!this.ctx.ltWorklet) {
+      const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'text/javascript' }));
+      this.ctx.ltWorklet = this.ctx.audioWorklet.addModule(url);
+    }
+    await this.ctx.ltWorklet;
+    this.src = this.ctx.createMediaStreamSource(new MediaStream([this.track]));
+    this.node = new AudioWorkletNode(this.ctx, 'lt-capture', { channelCount: 1, channelCountMode: 'explicit' });
+    this.mute = this.ctx.createGain();
+    this.mute.gain.value = 0;
+    this.node.port.onmessage = e => this.feed(e.data);
+    this.src.connect(this.node).connect(this.mute).connect(this.ctx.destination);
+  }
+
+  stop() {
+    if (this.node) this.node.port.onmessage = null;
+    try { this.src?.disconnect(); this.node?.disconnect(); this.mute?.disconnect(); } catch {}
+    if (this.speaking) this.finish();
+  }
+
+  // 기기 샘플레이트 → 16kHz (구간 평균)
+  feed(chunk) {
+    const r = this.ratio;
+    let buf = chunk;
+    if (this.left.length) {
+      buf = new Float32Array(this.left.length + chunk.length);
+      buf.set(this.left);
+      buf.set(chunk, this.left.length);
+    }
+    let t = this.t;
+    while (t + r <= buf.length) {
+      const a = Math.floor(t);
+      const b = Math.max(a + 1, Math.floor(t + r));
+      let s = 0;
+      for (let i = a; i < b; i++) s += buf[i];
+      this.buf.push(s / (b - a));
+      t += r;
+    }
+    const keep = Math.floor(t);
+    this.left = buf.slice(keep);
+    this.t = t - keep;
+    while (this.buf.length >= FRAME) this.frame(Float32Array.from(this.buf.splice(0, FRAME)));
+  }
+
+  frame(f) {
+    let e = 0;
+    for (let i = 0; i < f.length; i++) e += f[i] * f[i];
+    const level = Math.sqrt(e / f.length);
+    if (!this.noise) this.noise = Math.max(level, 1e-4);
+    if (!this.speaking) {
+      // 주변 소음 크기를 계속 따라감 (조용해지면 빠르게, 시끄러워지면 천천히)
+      this.noise = level < this.noise ? this.noise * 0.9 + level * 0.1 : this.noise * 0.998 + level * 0.002;
+    }
+    const voiced = level > Math.max(this.noise * 3, 0.004);
+    if (!this.speaking) {
+      this.pre.push([f, level]);
+      if (this.pre.length > PREROLL) this.pre.shift();
+      this.run = voiced ? this.run + 1 : 0;
+      if (this.run < 3) return;
+      this.speaking = true;
+      this.frames = this.pre.map(p => p[0]);
+      this.levels = this.pre.map(p => p[1]);
+      this.pre = [];
+      this.silent = 0;
+      this.voiced = this.run;
+      this.run = 0;
+      this.h.onStart(this);
+      return;
+    }
+    this.frames.push(f);
+    this.levels.push(level);
+    if (voiced) { this.silent = 0; this.voiced++; } else this.silent++;
+    if (this.silent >= END_SILENCE) this.finish();
+    else if (this.frames.length >= MAX_FRAMES) this.cut();
+  }
+
+  finish() {
+    this.speaking = false;
+    const frames = this.frames.slice(0, Math.max(0, this.frames.length - this.silent + 10));
+    const voiced = this.voiced;
+    this.frames = [];
+    this.levels = [];
+    this.silent = 0;
+    this.voiced = 0;
+    if (voiced < MIN_VOICED) this.h.onDrop(this);
+    else this.h.onSegment(this, joinFrames(frames));
+  }
+
+  // 너무 길게 이어지는 말: 마지막 3초 중 가장 조용한 곳에서 자르고 계속 들음
+  cut() {
+    const n = this.frames.length;
+    let at = n - 1;
+    for (let i = n - 150; i < n; i++) if (this.levels[i] < this.levels[at]) at = i;
+    const head = this.frames.splice(0, at + 1);
+    this.levels.splice(0, at + 1);
+    this.voiced = this.frames.length;
+    this.silent = 0;
+    this.h.onSegment(this, joinFrames(head));
+    this.h.onStart(this);
+  }
+}
+
+function joinFrames(frames) {
+  const out = new Float32Array(frames.length * FRAME);
+  frames.forEach((f, i) => out.set(f, i * FRAME));
+  return out;
+}
+
+// Whisper 실행기: 기본은 백그라운드 워커, 워커에서 GPU를 못 쓰는 브라우저는 페이지에서 실행
+const asr = {
+  worker: null,
+  page: null,
+  pageQueue: Promise.resolve(),
+  loading: null,
+  requested: '',
+  ready: false,
+  device: '',
+  jobs: new Map(),
+  nextId: 1,
+  onProgress: null,
+
+  load(model) {
+    if (this.loading && this.requested === model) return this.loading;
+    this.reset();
+    this.requested = model;
+    this.loading = new Promise((resolve, reject) => {
+      const loadInPage = async () => {
+        const { loadASR } = await import('./whisper-core.js');
+        this.page = await loadASR({ model, onProgress: (p, total) => this.onProgress?.(p, total) });
+        this.device = this.page.device;
+        this.ready = true;
+      };
+      let w;
+      try {
+        w = new Worker('whisper-worker.js', { type: 'module' });
+      } catch {
+        loadInPage().then(resolve, reject);
+        return;
+      }
+      this.worker = w;
+      w.onmessage = ({ data }) => {
+        if (data.type === 'caps') {
+          if (!data.gpu && navigator.gpu) {
+            w.terminate();
+            this.worker = null;
+            loadInPage().then(resolve, reject);
+          } else {
+            w.postMessage({ type: 'load', model });
+          }
+        } else if (data.type === 'progress') {
+          this.onProgress?.(data.p, data.total);
+        } else if (data.type === 'ready') {
+          this.device = data.device;
+          this.ready = true;
+          resolve();
+        } else if (data.type === 'result') {
+          this.jobs.get(data.id)?.resolve(data);
+          this.jobs.delete(data.id);
+        } else if (data.type === 'error') {
+          const job = this.jobs.get(data.id);
+          if (job) { job.reject(new Error(data.message)); this.jobs.delete(data.id); }
+          else if (!this.ready) reject(new Error(data.message));
+        }
+      };
+      w.onerror = e => { if (!this.ready) reject(new Error(e.message || '음성 모델을 불러오지 못했어요')); };
+    });
+    this.loading.catch(() => this.reset());
+    return this.loading;
+  },
+
+  reset() {
+    this.worker?.terminate();
+    this.jobs.forEach(j => j.reject(new Error('음성 모델이 바뀌었어요')));
+    Object.assign(this, { worker: null, page: null, loading: null, requested: '', ready: false, device: '', jobs: new Map() });
+  },
+
+  // langs: 후보 언어 (상대 언어, 내 언어) — 이 중 어느 언어인지 소리로 판별해서 받아 적음
+  async transcribe(audio, langs) {
+    await this.loading;
+    if (this.page) {
+      const run = this.pageQueue.catch(() => {}).then(() => this.page.transcribe(audio, langs));
+      this.pageQueue = run;
+      return run;
+    }
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.jobs.set(id, { resolve, reject });
+      this.worker.postMessage({ type: 'transcribe', id, audio, langs }, [audio.buffer]);
+    });
+  },
+};
+
+const auto = { ctx: null, segs: [], mic: null, busy: 0, progress: '' };
+
+const autoHandlers = {
+  onStart(seg) {
+    if (!seg.line) seg.line = pendingLine();
+  },
+  onDrop(seg) {
+    seg.line?.node.remove();
+    seg.line = null;
+    renderHint();
+  },
+  onSegment(seg, audio) {
+    const line = seg.line || pendingLine();
+    seg.line = null;
+    auto.busy++;
+    asr.transcribe(audio, [S.their, S.mine])
+      .then(r => autoResult(line, r))
+      .catch(err => {
+        console.warn('asr failed', err);
+        line.node.remove();
+        setStatus(`음성 인식 오류: ${err.message}`, true);
+      })
+      .finally(() => {
+        auto.busy--;
+        if (auto.busy > 3) setStatus('자막이 밀리고 있어요 — 기기가 느리면 엔진을 "자동 감지 · 빠름"으로 바꿔 보세요.', false, true);
+        renderHint();
+      });
+  },
+};
+
+// 말소리가 들리면 먼저 '…' 줄을 띄우고, 받아 적기가 끝나면 채움
+function pendingLine() {
+  const line = newLine('them');
+  line.node.className = 'line pending interim';
+  line.trEl.textContent = '…';
+  autoscroll();
+  return line;
+}
+
+async function autoResult(line, { text, language }) {
+  text = cleanTranscript(text);
+  if (!text) {
+    line.node.remove();
+    return;
+  }
+  const side = await detectSide(text, language);
+  const [from, to] = sideLangs(side);
+  Object.assign(line, { side, from, to, text });
+  line.node.className = `line ${side}`;
+  line.srcEl.textContent = text;
+  line.trEl.textContent = '';
+  translateLine(line);
+  autoscroll();
+}
+
+// Whisper가 조용한 소리에서 지어내는 흔한 문구·효과음 표시는 버림
+const JUNK = [
+  /시청해\s*주셔서\s*감사합니다/, /구독(과|이나)?\s*좋아요/, /MBC\s*뉴스/, /자막\s*(제공|by)/i,
+  /thanks? (you )?for watching/i, /please subscribe/i, /^(you|bye)\.?$/i,
+];
+
+function cleanTranscript(t) {
+  t = (t || '')
+    .replace(/[[(（【][^\])）】]*[\])）】]/g, '')
+    .replace(/[♪♫]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t || /^[\s.,!?…·-]+$/.test(t)) return '';
+  if (JUNK.some(re => re.test(t))) return '';
+  return t;
+}
+
+// 말한 언어가 '상대 언어'인지 '내 언어'인지 판단 → 번역 방향 결정
+const SCRIPTS = {
+  ko: /[ᄀ-ᇿ㄰-㆏가-힯]/g,
+  ja: /[぀-ヿ]/g,
+  zh: /[一-鿿]/g,
+  th: /[฀-๿]/g,
+  ru: /[Ѐ-ӿ]/g,
+};
+const LATIN = /[a-zÀ-ɏ]/gi;
+
+async function detectSide(text, whisperLang) {
+  const a = S.their;
+  const b = S.mine;
+  // 0) Whisper가 소리로 판별한 언어 (가장 정확)
+  if (whisperLang === b && a !== b) return 'me';
+  if (whisperLang === a) return 'them';
+  // 1) 일본어 가나가 있으면 일본어 (한자만으로는 중국어와 구분 안 됨)
+  if ((a === 'ja' || b === 'ja') && /[぀-ヿ]/.test(text)) return b === 'ja' ? 'me' : 'them';
+  // 2) 글자 종류로 구분 (한글 ↔ 영어처럼 문자가 다른 경우)
+  const ra = SCRIPTS[a] || LATIN;
+  const rb = SCRIPTS[b] || LATIN;
+  if (ra !== rb) {
+    const ca = (text.match(ra) || []).length;
+    const cb = (text.match(rb) || []).length;
+    if (ca !== cb) return cb > ca ? 'me' : 'them';
+  }
+  // 3) 브라우저 언어 감지 → 온라인 감지
+  return (await detectLanguage(text)) === b ? 'me' : 'them';
+}
+
+let languageDetector = null;
+async function detectLanguage(text) {
+  try {
+    if ('LanguageDetector' in self) {
+      languageDetector ||= LanguageDetector.create().catch(() => null);
+      const d = await languageDetector;
+      const top = d && (await d.detect(text))[0];
+      if (top && top.confidence > 0.5) return top.detectedLanguage.split('-')[0];
+    }
+  } catch {}
+  try { return (await translateOnlineRaw(text, 'auto', S.mine)).src; } catch { return ''; }
+}
+
+function loadModel(model) {
+  if (asr.ready && asr.requested === model) return;
+  asr.onProgress = (p, total) => {
+    auto.progress = `음성 모델 내려받는 중 ${Math.round(p * 100)}% (${Math.round(total / 1048576)}MB, 처음 한 번만)`;
+    setStatus(auto.progress, false, true);
+    renderHint();
+  };
+  auto.progress = '음성 모델 준비 중…';
+  setStatus(auto.progress, false, true);
+  asr.load(model).then(() => {
+    auto.progress = '';
+    if (app.running) setStatus(listeningText());
+    renderHint();
+  }).catch(err => {
+    auto.progress = '';
+    setStatus(`음성 모델을 불러오지 못했어요: ${err.message}`, true);
+    renderHint();
+  });
+  renderHint();
+}
+
+function micDeniedText() {
+  if (IS_IOS) return '마이크가 거부됐어요. 설정 > 앱 > Safari(또는 크롬) > 마이크를 "허용"으로 바꾸고 새로고침해 주세요.';
+  return '마이크 권한이 거부됐어요. 주소창 왼쪽 아이콘에서 마이크를 허용한 뒤 다시 시작해 주세요.';
+}
+
+async function startAuto() {
+  if (!window.AudioWorkletNode || !navigator.mediaDevices?.getUserMedia) {
+    setStatus('이 브라우저는 너무 오래돼서 자동 감지를 쓸 수 없어요. 최신 크롬·사파리로 열어 주세요.', true);
+    return;
+  }
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx(); // 탭(클릭) 안에서 만들어야 아이폰에서 소리가 들어옴
+  ctx.resume().catch(() => {});
+  prepareTranslators();
+  app.starting = true;
+  app.engine = 'auto';
+  auto.ctx = ctx;
+  renderUI();
+  try {
+    const tracks = [];
+    if (S.mode === 'call' || (S.mode === 'listen' && S.source === 'pc')) tracks.push(await capturePcAudio(false));
+    if (S.mode !== 'listen' || S.source === 'mic') {
+      try {
+        auto.mic = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch (err) {
+        throw new Error(err.name === 'NotAllowedError' ? micDeniedText() : `마이크를 열지 못했어요: ${err.message}`);
+      }
+      tracks.push(auto.mic.getAudioTracks()[0]);
+    }
+    if (ctx.state !== 'running') await ctx.resume().catch(() => {});
+    loadModel(WHISPER_MODEL[S.engine]); // 내려받는 동안에도 듣기 시작 → 준비되면 차례로 받아 적음
+    auto.segs = tracks.map(t => new Segmenter(ctx, t, autoHandlers));
+    await Promise.all(auto.segs.map(s => s.start()));
+    ctx.onstatechange = () => {
+      if (app.running && app.engine === 'auto' && ctx.state !== 'running' && ctx.state !== 'closed') {
+        app.needsTap = true;
+        renderUI();
+      }
+    };
+    app.running = true;
+    app.needsTap = ctx.state !== 'running';
+    keepAwake();
+    if (!auto.progress) setStatus(listeningText());
+  } catch (err) {
+    cleanupAuto();
+    if (app.stream) {
+      app.stream.getTracks().forEach(t => t.stop());
+      app.stream = null;
+    }
+    setStatus(err.message, true);
+  } finally {
+    app.starting = false;
+    renderUI();
+  }
+}
+
+function cleanupAuto() {
+  auto.segs.forEach(s => s.stop());
+  auto.segs = [];
+  auto.mic?.getTracks().forEach(t => t.stop());
+  auto.mic = null;
+  if (auto.ctx) {
+    auto.ctx.onstatechange = null;
+    auto.ctx.close().catch(() => {});
+    auto.ctx = null;
+  }
+}
+
 // ===== 설정 바 =====
 function fillSelects() {
+  el.asr.innerHTML = '';
+  for (const [id, label] of Object.entries(ENGINES)) el.asr.add(new Option(label, id));
   el.mode.innerHTML = '';
   for (const [id, label] of Object.entries(MODES)) {
     const o = new Option(label, id);
@@ -658,6 +1132,8 @@ function renderUI() {
   document.body.classList.toggle('no-src', !S.showSrc);
   document.documentElement.style.setProperty('--fs', `${S.fontSize}px`);
   el.run.textContent = app.running ? '■ 정지' : '▶ 시작';
+  el.asr.value = S.engine;
+  el.asr.disabled = r;
   el.mode.value = S.mode;
   el.mode.disabled = r;
   el.source.value = S.source;
@@ -670,7 +1146,7 @@ function renderUI() {
 
   let speak = '';
   let speakSide = '';
-  if (app.running && S.mode === 'talk') {
+  if (app.running && app.engine === 'chrome' && S.mode === 'talk') {
     speakSide = app.talkSide;
     const lang = app.talkSide === 'them' ? S.their : S.mine;
     speak = `🎙 ${app.talkSide === 'them' ? '상대' : '나'} · ${LANG[lang].name}  ⇄`;
@@ -699,6 +1175,11 @@ function renderHint(extra = '') {
     el.hintText.textContent = '아이폰은 듣기가 끊기면 한 번 탭해야 이어서 들어요.';
     return;
   }
+  if (app.running && app.engine === 'auto') {
+    el.hintBtn.hidden = true;
+    el.hintText.textContent = `🎙 ${listeningText()}\n${auto.progress || '아무 언어로나 말해 보세요 — 말이 끝나면 자막이 떠요'}`;
+    return;
+  }
   if (app.running) {
     const lang = S.mode === 'talk' && app.talkSide === 'me' ? S.mine : S.their;
     el.hintBtn.hidden = true;
@@ -708,13 +1189,22 @@ function renderHint(extra = '') {
   }
   el.hintBtn.hidden = false;
   el.hintBtn.textContent = '▶ 시작';
+  if (S.engine !== 'chrome') {
+    const pair = `${LANG[S.their].name} / ${LANG[S.mine].name}`;
+    el.hintText.textContent = {
+      call: `상대 소리(PC)와 내 마이크를 함께 듣고, 말한 언어(${pair})를 자동으로 알아내 번역해요. 시작하면 뜨는 공유 창에서 통화 창(또는 전체 화면)과 '오디오 공유'를 켜세요.`,
+      listen: `${S.source === 'pc' ? 'PC에서 나는 소리' : '마이크로 들리는 말'}을 듣고, 말한 언어(${pair})를 자동으로 알아내 번역해요.`,
+      talk: `마이크로 듣고, 누가 무슨 언어(${pair})로 말하든 자동으로 알아내 번역해요.`,
+    }[S.mode] + `\n처음 한 번은 음성 모델을 내려받아요 (${S.engine === 'auto-small' ? '약 320MB' : '약 90MB'}).`;
+    return;
+  }
   el.hintText.textContent = {
     call: "상대 소리(PC)와 내 마이크를 함께 받아 적어요. 시작하면 뜨는 공유 창에서 통화 창(또는 전체 화면)을 고르고 '오디오 공유'를 켜세요. 헤드폰을 쓰면 더 정확해요.",
     listen: S.source === 'pc'
       ? `PC에서 나는 ${LANG[S.their].name} 소리를 받아 적어 ${LANG[S.mine].name}로 번역해요.`
       : `마이크로 들리는 ${LANG[S.their].name} 말을 받아 적어 ${LANG[S.mine].name}로 번역해요.`,
     talk: '마이크 하나로 번갈아 말해요. 아래 버튼(또는 Space)으로 말하는 사람을 바꿔요.',
-  }[S.mode] + (IOS_NOT_SAFARI ? '\n\n⚠ 아이폰은 사파리에서만 음성인식이 돼요. 이 주소를 사파리로 열어 주세요.' : '');
+  }[S.mode] + (IOS_NOT_SAFARI ? '\n\n⚠ 아이폰 크롬·앱 안 브라우저에서는 "언어 고정" 엔진이 안 돼요. "자동 감지"를 쓰거나 사파리로 열어 주세요.' : '');
 }
 
 function onLangChange() {
@@ -750,6 +1240,12 @@ function showUI(stay = false) {
 }
 
 el.run.addEventListener('click', toggleRun);
+el.asr.addEventListener('change', () => {
+  S.engine = el.asr.value;
+  saveSettings();
+  if (S.engine === 'chrome' && !SR) setStatus('이 브라우저는 크롬 음성인식을 지원하지 않아요. "자동 감지"를 써 주세요.', true);
+  renderUI();
+});
 el.mode.addEventListener('change', () => { S.mode = el.mode.value; saveSettings(); renderUI(); });
 el.source.addEventListener('change', () => { S.source = el.source.value; saveSettings(); renderUI(); });
 el.their.addEventListener('change', () => { S.their = el.their.value; onLangChange(); });
@@ -843,6 +1339,6 @@ async function runDemo() {
 // ===== 시작 =====
 fillSelects();
 renderUI();
-if (!SR) setStatus('이 브라우저는 음성인식을 지원하지 않아요. PC·안드로이드는 크롬, 아이폰은 사파리로 열어 주세요.', true);
+if (!SR && S.engine === 'chrome') setStatus('이 브라우저는 크롬 음성인식을 지원하지 않아요. "자동 감지"를 써 주세요.', true);
 setEngine('Translator' in self ? '기기 내 (첫 시작 때 준비)' : '온라인');
 if (DEMO) runDemo();
