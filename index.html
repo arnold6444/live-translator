@@ -46,12 +46,11 @@
       font-size: var(--fs);
       overflow-wrap: anywhere;
     }
-    .line.me { text-align: right; }
+    /* 누가 말했든 한 줄로 이어지는 하나의 스크립트 (왼쪽/오른쪽 구분 없음) */
     .line .src { font-size: 0.5em; line-height: 1.4; color: var(--dim); margin-bottom: 0.15em; }
     .line .tr { line-height: 1.35; font-weight: 600; }
     .line .tr:empty { display: none; }
     .line .tr.fail { color: var(--dim); font-weight: 400; font-size: 0.5em; }
-    .line.me .tr { color: var(--me); }
     .line.interim { opacity: 0.55; }
     .line.pending .tr { color: var(--dim); font-weight: 400; }
     body.no-src .line .src { display: none; }
