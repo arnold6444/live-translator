@@ -169,6 +169,11 @@ async function translateLine(line) {
   } catch (err) {
     console.warn('translate failed', err);
     if (id !== line.req || line.node.classList.contains('interim')) return;
+    if (!line.retried) { // 한 번은 3초 뒤 다시 시도
+      line.retried = true;
+      setTimeout(() => { if (id === line.req) translateLine(line); }, 3000);
+      return;
+    }
     line.trEl.textContent = '(번역 실패 — 인터넷 연결 확인)';
     line.trEl.classList.add('fail');
   }
@@ -212,7 +217,8 @@ function prepareTranslators() {
         targetLanguage: to,
         monitor(m) {
           m.addEventListener('downloadprogress', e => {
-            setStatus(`번역 모델 내려받는 중 ${Math.round(e.loaded * 100)}% (그동안은 온라인 번역)`);
+            // 이미 받아 둔 경우에도 0%·100% 신호가 오므로 실제로 받는 중일 때만 표시
+            if (e.loaded > 0 && e.loaded < 1) setStatus(`번역 모델 내려받는 중 ${Math.round(e.loaded * 100)}% (그동안은 온라인 번역)`);
           });
         },
       });
@@ -257,16 +263,54 @@ async function translateOnline(text, from, to) {
   return (await translateOnlineRaw(text, from, to)).text;
 }
 
+// 무료 온라인 번역: 여러 곳을 차례로 시도하고, 막힌 곳(429 '요청 너무 많음' 등)은 잠시 건너뜀
+const PROVIDERS = [
+  {
+    name: 'google',
+    url: (q, sl, tl) => `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sl}&tl=${tl}&q=${q}`,
+    parse: d => (Array.isArray(d[0]) ? { text: d[0][0], src: d[0][1] } : { text: d[0] }),
+  },
+  {
+    name: 'google-gtx',
+    url: (q, sl, tl) => `https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=${sl}&tl=${tl}&q=${q}`,
+    parse: d => ({ text: (d[0] || []).map(seg => seg[0]).join(''), src: d[2] }),
+  },
+  {
+    name: 'mymemory',
+    noAuto: true,
+    url: (q, sl, tl) => `https://api.mymemory.translated.net/get?q=${q}&langpair=${sl}|${tl}`,
+    parse: d => {
+      if (d.responseStatus !== 200) throw new Error(d.responseDetails || 'mymemory');
+      return { text: d.responseData.translatedText };
+    },
+  },
+];
+const providerDownUntil = {};
+
 // from에 'auto'를 주면 src에 감지된 언어가 옴
 async function translateOnlineRaw(text, from, to) {
   const sl = from === 'auto' ? 'auto' : (LANG[from].web || from);
   const tl = LANG[to].web || to;
-  const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t' +
-    `&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&q=${encodeURIComponent(text.slice(0, 1500))}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  return { text: (data[0] || []).map(seg => seg[0]).join(''), src: String(data[2] || '').split('-')[0] };
+  const q = encodeURIComponent(text.slice(0, 1500));
+  const usable = PROVIDERS.filter(p => !(sl === 'auto' && p.noAuto));
+  const ready = usable.filter(p => !(providerDownUntil[p.name] > Date.now()));
+  let lastErr = null;
+  for (const p of ready.length ? ready : usable) { // 전부 쉬는 중이면 그래도 다 시도
+    try {
+      const res = await fetch(p.url(q, encodeURIComponent(sl), encodeURIComponent(tl)));
+      if (!res.ok) throw Object.assign(new Error(`${p.name} HTTP ${res.status}`), { status: res.status });
+      const r = p.parse(await res.json());
+      if (!r.text) throw new Error(`${p.name}: 빈 결과`);
+      return { text: r.text, src: String(r.src || '').split('-')[0] };
+    } catch (err) {
+      lastErr = err;
+      // 429: 30분, 다른 오류: 2분, 연결 끊김: 15초 쉬기
+      const pause = err.status === 429 ? 30 * 60000 : err.status ? 2 * 60000 : 15000;
+      providerDownUntil[p.name] = Date.now() + pause;
+      console.warn('translation provider failed', p.name, err.message);
+    }
+  }
+  throw lastErr || new Error('번역 서비스에 연결할 수 없어요');
 }
 
 // ===== 음성인식 =====
@@ -673,7 +717,9 @@ document.addEventListener('visibilitychange', () => {
 const RATE = 16000;      // Whisper 입력
 const FRAME = 320;       // 20ms
 const PREROLL = 15;      // 말 시작 직전 0.3초도 포함
-const END_SILENCE = 35;  // 0.7초 조용하면 문장 끝
+const END_SILENCE = 25;  // 0.5초 조용하면 문장 끝
+const PARTIAL_MIN = 40;  // 0.8초 이상 말하면 말하는 중에도 받아 적어 보여줌
+const PARTIAL_GAP = 600; // 그 간격(ms)
 const MAX_FRAMES = 600;  // 12초가 넘으면 조용한 곳에서 자름
 const MIN_VOICED = 12;   // 0.24초보다 짧은 소리는 무시
 
@@ -785,6 +831,7 @@ class Segmenter {
     if (voiced) { this.silent = 0; this.voiced++; } else this.silent++;
     if (this.silent >= END_SILENCE) this.finish();
     else if (this.frames.length >= MAX_FRAMES) this.cut();
+    else this.h.onFrame(this);
   }
 
   finish() {
@@ -903,22 +950,81 @@ const asr = {
   },
 };
 
-const auto = { ctx: null, segs: [], mic: null, busy: 0, progress: '' };
+const auto = { ctx: null, segs: [], mic: null, busy: 0, progress: '', partials: true };
+
+// 받아 적기 순서: 끝난 문장이 먼저, 말하는 중 미리보기는 남는 시간에. 같은 소리의 오래된 미리보기는 버림
+const sched = {
+  queue: [],
+  running: false,
+  run(audio, langs, partialKey = null) {
+    return new Promise((resolve, reject) => {
+      if (partialKey) {
+        this.queue = this.queue.filter(j => {
+          if (j.key !== partialKey) return true;
+          j.resolve(null);
+          return false;
+        });
+      }
+      this.queue.push({ audio, langs, key: partialKey, resolve, reject });
+      this.pump();
+    });
+  },
+  async pump() {
+    if (this.running) return;
+    this.running = true;
+    while (this.queue.length) {
+      let i = this.queue.findIndex(j => !j.key);
+      if (i < 0) i = 0;
+      const job = this.queue.splice(i, 1)[0];
+      const t0 = performance.now();
+      try {
+        const r = await asr.transcribe(job.audio, job.langs);
+        job.resolve({ ...r, ms: performance.now() - t0 });
+      } catch (err) {
+        job.reject(err);
+      }
+    }
+    this.running = false;
+  },
+};
 
 const autoHandlers = {
   onStart(seg) {
     if (!seg.line) seg.line = pendingLine();
   },
+  // 말하는 중: 지금까지 들은 소리를 주기적으로 받아 적어 미리 보여줌
+  onFrame(seg) {
+    if (!auto.partials || !asr.ready || seg.partialBusy || !seg.line) return;
+    if (seg.frames.length < PARTIAL_MIN || Date.now() - (seg.partialAt || 0) < PARTIAL_GAP) return;
+    if (seg.silent > 0) return; // 말이 멈칫할 때 시작하면 문장 끝 받아 적기가 그만큼 늦어짐
+    const line = seg.line;
+    seg.partialBusy = true;
+    sched.run(joinFrames(seg.frames), [S.their, S.mine], seg)
+      .then(r => {
+        if (!r) return;
+        if (r.ms > 2000) auto.partials = false; // 기기가 느리면 미리보기 끄고 문장 끝에만 받아 적음
+        showPartial(line, r);
+      })
+      .catch(() => {})
+      .finally(() => {
+        seg.partialBusy = false;
+        seg.partialAt = Date.now();
+      });
+  },
   onDrop(seg) {
-    seg.line?.node.remove();
+    if (seg.line) {
+      seg.line.closed = true;
+      seg.line.node.remove();
+    }
     seg.line = null;
     renderHint();
   },
   onSegment(seg, audio) {
     const line = seg.line || pendingLine();
+    line.closed = true; // 이후 도착하는 미리보기는 무시
     seg.line = null;
     auto.busy++;
-    asr.transcribe(audio, [S.their, S.mine])
+    sched.run(audio, [S.their, S.mine])
       .then(r => autoResult(line, r))
       .catch(err => {
         console.warn('asr failed', err);
@@ -940,6 +1046,20 @@ function pendingLine() {
   line.trEl.textContent = '…';
   autoscroll();
   return line;
+}
+
+function showPartial(line, { text, language }) {
+  if (line.closed) return;
+  text = cleanTranscript(text);
+  if (!text) return;
+  const side = language === S.mine && S.their !== S.mine ? 'me' : 'them';
+  line.node.className = `line pending interim ${side}`;
+  line.srcEl.textContent = text;
+  // 기기 안 번역(PC 크롬)이 있으면 말하는 중에도 번역. 온라인 번역은 너무 자주 부르면 막혀서 문장 끝에만
+  const [from, to] = sideLangs(side);
+  const t = from !== to && readyOnDevice(from, to);
+  if (t) t.translate(text).then(out => { if (!line.closed) line.trEl.textContent = out; }).catch(() => {});
+  autoscroll();
 }
 
 async function autoResult(line, { text, language }) {
@@ -1018,24 +1138,44 @@ async function detectLanguage(text) {
   try { return (await translateOnlineRaw(text, 'auto', S.mine)).src; } catch { return ''; }
 }
 
-function loadModel(model) {
-  if (asr.ready && asr.requested === model) return;
-  asr.onProgress = (p, total) => {
+// 받아 둔 모델이 있는지 (transformers.js가 쓰는 브라우저 캐시 확인)
+async function modelCached(model) {
+  try {
+    const cache = await caches.open('transformers-cache');
+    return !!(await cache.match(`https://huggingface.co/${model}/resolve/main/onnx/decoder_model_merged_quantized.onnx`));
+  } catch {
+    return false;
+  }
+}
+
+// 받아 둔 모델이면 페이지를 열자마자 미리 불러와서 시작 버튼을 누르면 바로 들음
+function preloadModel() {
+  const model = WHISPER_MODEL[S.engine];
+  if (!model || asr.requested === model) return;
+  modelCached(model).then(hit => { if (hit && WHISPER_MODEL[S.engine] === model) loadModel(model); });
+}
+
+async function loadModel(model) {
+  if (asr.requested === model && asr.loading) return; // 이미 준비됐거나 준비 중
+  const cached = await modelCached(model);
+  if (asr.requested === model && asr.loading) return;
+  auto.progress = cached ? '음성 모델 불러오는 중…' : '음성 모델 내려받는 중…';
+  asr.onProgress = cached ? null : (p, total) => {
     auto.progress = `음성 모델 내려받는 중 ${Math.round(p * 100)}% (${Math.round(total / 1048576)}MB, 처음 한 번만)`;
     setStatus(auto.progress, false, true);
     renderHint();
   };
-  auto.progress = '음성 모델 준비 중…';
   setStatus(auto.progress, false, true);
-  asr.load(model).then(() => {
+  renderHint();
+  try {
+    await asr.load(model);
     auto.progress = '';
-    if (app.running) setStatus(listeningText());
-    renderHint();
-  }).catch(err => {
+    setStatus(app.running ? listeningText() : '음성 모델 준비됨 — ▶ 시작을 누르면 바로 들어요');
+    if (!cached) navigator.storage?.persist?.().catch(() => {}); // 브라우저가 모델을 지우지 않게 요청
+  } catch (err) {
     auto.progress = '';
     setStatus(`음성 모델을 불러오지 못했어요: ${err.message}`, true);
-    renderHint();
-  });
+  }
   renderHint();
 }
 
@@ -1072,6 +1212,7 @@ async function startAuto() {
     }
     if (ctx.state !== 'running') await ctx.resume().catch(() => {});
     loadModel(WHISPER_MODEL[S.engine]); // 내려받는 동안에도 듣기 시작 → 준비되면 차례로 받아 적음
+    auto.partials = true;
     auto.segs = tracks.map(t => new Segmenter(ctx, t, autoHandlers));
     await Promise.all(auto.segs.map(s => s.start()));
     ctx.onstatechange = () => {
@@ -1244,6 +1385,7 @@ el.asr.addEventListener('change', () => {
   S.engine = el.asr.value;
   saveSettings();
   if (S.engine === 'chrome' && !SR) setStatus('이 브라우저는 크롬 음성인식을 지원하지 않아요. "자동 감지"를 써 주세요.', true);
+  preloadModel();
   renderUI();
 });
 el.mode.addEventListener('change', () => { S.mode = el.mode.value; saveSettings(); renderUI(); });
@@ -1342,3 +1484,4 @@ renderUI();
 if (!SR && S.engine === 'chrome') setStatus('이 브라우저는 크롬 음성인식을 지원하지 않아요. "자동 감지"를 써 주세요.', true);
 setEngine('Translator' in self ? '기기 내 (첫 시작 때 준비)' : '온라인');
 if (DEMO) runDemo();
+else preloadModel();
